@@ -5,17 +5,25 @@ import os
 from dotenv import load_dotenv
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langsmith import traceable
 
 # -------------------------------
 # .env'den API key yükle
 # -------------------------------
 load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
+
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = "adenya-rag"
+
+
 
 # -------------------------------
 # FastAPI setup
@@ -25,7 +33,7 @@ app = FastAPI()
 FAISS_PATH = "faiss_index"
 DATA_URL = "https://wpapi.adenyahotels.com.tr/api/Whatsapp/GetListFags?sec=XCORE_9fK3Lx7QpA2mZ8WcR5tYvN6uH1sD4eJ0bGkLqPzR"
 
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
 vectorstore = None  # global store
 
 # LLM nesnesi
@@ -37,6 +45,7 @@ memory_store = {}
 # -------------------------------
 # JSON → Document dönüşümü
 # -------------------------------
+@traceable(name="json_to_documents")
 def json_to_documents(knowledge):
     docs = []
     for item in knowledge:
@@ -54,15 +63,31 @@ def json_to_documents(knowledge):
 # -------------------------------
 # Vectorstore oluştur / güncelle
 # -------------------------------
+@traceable(name="build_vectorstore")
 def build_vectorstore():
     global vectorstore
     response = requests.get(DATA_URL)
     knowledge = response.json()
     docs = json_to_documents(knowledge)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100
+    )
+
     split_docs = splitter.split_documents(docs)
-    vectorstore = FAISS.from_documents(documents=split_docs, embedding=embedding_model)
+
+    vectorstore = FAISS.from_documents(
+        documents=split_docs,
+        embedding=embedding_model
+    )
+
     vectorstore.save_local(FAISS_PATH)
+
+    return {
+        "doc_count": len(docs),
+        "chunk_count": len(split_docs)
+    }
 
 # -------------------------------
 # Uygulama başlarken yükle
@@ -106,14 +131,20 @@ class ChatRequest(BaseModel):
     user_id: str
     query: str
 
+@traceable(name="vector_search")
 def get_context_from_vectorstore(query):
-    # Direkt vectorstore kullanımı, HTTP çağrısı yok
     docs = vectorstore.similarity_search(query, k=5)
-    return "\n\n".join([doc.page_content for doc in docs])
 
+    return {
+        "context": "\n\n".join([doc.page_content for doc in docs]),
+        "sources": [doc.metadata for doc in docs]
+    }
+
+@traceable(name="get_memory")
 def get_memory(user_id):
     return memory_store.get(user_id, [])
 
+@traceable(name="save_memory")
 def save_memory(user_id, user_msg, ai_msg):
     if user_id not in memory_store:
         memory_store[user_id] = []
@@ -121,6 +152,10 @@ def save_memory(user_id, user_msg, ai_msg):
     memory_store[user_id].append(AIMessage(content=ai_msg))
     memory_store[user_id] = memory_store[user_id][-10:]
 
+@traceable(
+    name="chat_endpoint",
+    metadata={"app": "adenya-rag"}
+)
 @app.post("/chat")
 def chat(req: ChatRequest):
     context = get_context_from_vectorstore(req.query)
